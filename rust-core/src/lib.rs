@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod jni_bridge;
 pub mod policy;
 pub mod proot;
 
