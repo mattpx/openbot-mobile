@@ -1,0 +1,13 @@
+{
+  "name": "openbot-mobile",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "frontend",
+    "shared"
+  ],
+  "scripts": {
+    "dev": "bun --cwd frontend dev",
+    "build": "bun --cwd frontend build"
+  }
+}
