@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">OpenBot Mobile</string>
+    <string name="coworker_ready">OpenBot Coworker Ready</string>
+    <string name="ask_coworker">Ask your AI Coworker...</string>
+    <string name="approval_required_title">Approval Required</string>
+    <string name="approve">Approve</string>
+    <string name="reject">Reject</string>
+</resources>
