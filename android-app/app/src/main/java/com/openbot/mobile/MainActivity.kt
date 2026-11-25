@@ -1,9 +1,12 @@
 package com.openbot.mobile
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.background
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -11,7 +14,6 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -19,6 +21,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import com.openbot.mobile.service.AgentForegroundService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -33,11 +36,18 @@ data class ChatMessage(
 )
 
 class MainActivity : ComponentActivity() {
+
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* no-op */ }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        requestNotificationPermissionIfNeeded()
         AgentForegroundService.start(this)
 
         val rootfsManager = RootfsManager(applicationContext)
+        val settingsStore = AgentSettingsStore(applicationContext)
 
         setContent {
             MaterialTheme {
@@ -45,8 +55,20 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    OpenBotApp(rootfsManager = rootfsManager)
+                    OpenBotApp(rootfsManager = rootfsManager, settingsStore = settingsStore)
                 }
+            }
+        }
+    }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
         }
     }
@@ -54,11 +76,15 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun OpenBotApp(rootfsManager: RootfsManager) {
+fun OpenBotApp(rootfsManager: RootfsManager, settingsStore: AgentSettingsStore) {
     val scope = rememberCoroutineScope()
     val listState = rememberLazyListState()
     var inputText by remember { mutableStateOf("") }
     var isBusy by remember { mutableStateOf(false) }
+    var initRequested by remember { mutableStateOf(false) }
+    var agentMode by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
+    var llmConfig by remember { mutableStateOf(settingsStore.load()) }
     val sandboxStatus by rootfsManager.status.collectAsState()
 
     val messages = remember {
@@ -66,53 +92,36 @@ fun OpenBotApp(rootfsManager: RootfsManager) {
             ChatMessage(
                 "1",
                 "OpenBot",
-                "👋 Hello! I am your OpenBot AI coworker running on Android with PRoot sandboxing.",
+                "👋 Hello! I am your OpenBot AI coworker running on Android with PRoot sandboxing.\n\n" +
+                    "• Direct mode: type shell commands to run in sandbox.\n" +
+                    "• Agent mode: configure LLM in Settings, then chat naturally; I'll propose commands in ```bash``` blocks.",
                 false
             )
         )
     }
+    val agentHistory = remember { mutableStateListOf<LlmChatMessage>() }
 
-    LaunchedEffect(Unit) {
-        when (val status = sandboxStatus) {
-            is SandboxStatus.Ready -> Unit
-            is SandboxStatus.SettingUp -> Unit
-            is SandboxStatus.Failed -> Unit
-            SandboxStatus.Uninitialized -> {
-                val ok = rootfsManager.initializeSandbox()
-                val statusMsg = if (ok) {
-                    val mode = if (OpenBotCore.isNativeLoaded()) "native Rust core" else "mock fallback core"
-                    "Sandbox ready ($mode). Try commands like `ls`, `pwd`, or `curl https://example.com`."
-                } else {
-                    "Sandbox initialization failed. Check logs and retry."
-                }
-                messages.add(
-                    ChatMessage(
-                        id = System.currentTimeMillis().toString(),
-                        sender = "OpenBot",
-                        text = statusMsg,
-                        isUser = false
-                    )
-                )
-            }
+    fun ensureAgentSystemPrompt() {
+        if (agentHistory.none { it.role == "system" }) {
+            agentHistory.add(0, LlmChatMessage("system", llmConfig.systemPrompt))
+        } else {
+            val idx = agentHistory.indexOfFirst { it.role == "system" }
+            if (idx >= 0) agentHistory[idx] = LlmChatMessage("system", llmConfig.systemPrompt)
         }
     }
 
     LaunchedEffect(sandboxStatus) {
-        when (val status = sandboxStatus) {
-            is SandboxStatus.Failed -> {
-                val last = messages.lastOrNull()?.text.orEmpty()
-                if (!last.contains(status.error)) {
-                    messages.add(
-                        ChatMessage(
-                            id = "status-${System.currentTimeMillis()}",
-                            sender = "OpenBot",
-                            text = "⚠️ Sandbox error: ${status.error}",
-                            isUser = false
-                        )
-                    )
-                }
+        if (!initRequested && sandboxStatus is SandboxStatus.Uninitialized) {
+            initRequested = true
+            val ok = rootfsManager.initializeSandbox()
+            val statusMsg = if (ok) {
+                val mode = if (OpenBotCore.isNativeLoaded()) "native Rust core" else "mock fallback core"
+                "Sandbox ready ($mode). Try `ls`, `pwd`, or enable Agent mode after configuring LLM settings."
+            } else {
+                val err = (rootfsManager.status.value as? SandboxStatus.Failed)?.error ?: "unknown error"
+                "Sandbox initialization failed: $err"
             }
-            else -> Unit
+            messages.add(ChatMessage("init-${System.currentTimeMillis()}", "OpenBot", statusMsg, false))
         }
     }
 
@@ -122,92 +131,147 @@ fun OpenBotApp(rootfsManager: RootfsManager) {
         }
     }
 
-    fun appendOutcome(command: String, outcome: ActionOutcomeData) {
-        when (outcome) {
+    fun appendOutcome(command: String, outcome: ActionOutcomeData): String {
+        val text = when (outcome) {
             is ActionOutcomeData.Executed -> {
                 val result = outcome.result
-                val body = buildString {
-                    append("`$command`\n")
-                    append("exit: ${result.exitCode}")
-                    if (result.stdout.isNotBlank()) {
-                        append("\n\nstdout:\n${result.stdout.trimEnd()}")
-                    }
-                    if (result.stderr.isNotBlank()) {
-                        append("\n\nstderr:\n${result.stderr.trimEnd()}")
-                    }
+                buildString {
+                    append("`$command`\nexit: ${result.exitCode}")
+                    if (result.stdout.isNotBlank()) append("\n\nstdout:\n${result.stdout.trimEnd()}")
+                    if (result.stderr.isNotBlank()) append("\n\nstderr:\n${result.stderr.trimEnd()}")
                 }
-                messages.add(
-                    ChatMessage(
-                        id = "exec-${System.currentTimeMillis()}",
-                        sender = "OpenBot",
-                        text = body,
-                        isUser = false
-                    )
-                )
             }
-            is ActionOutcomeData.NeedsApproval -> {
-                messages.add(
-                    ChatMessage(
-                        id = "appr-${System.currentTimeMillis()}",
-                        sender = "OpenBot",
-                        text = "I need approval before running this command.",
-                        isUser = false,
-                        pendingApproval = outcome.approval
-                    )
+            is ActionOutcomeData.NeedsApproval -> "Approval required for `$command`: ${outcome.approval.reason}"
+            is ActionOutcomeData.Denied -> "❌ Denied: ${outcome.reason}\nCommand: `$command`"
+            is ActionOutcomeData.Error -> "⚠️ Error: ${outcome.message}\nCommand: `$command`"
+        }
+        if (outcome is ActionOutcomeData.NeedsApproval) {
+            messages.add(
+                ChatMessage(
+                    id = "appr-${System.currentTimeMillis()}",
+                    sender = "OpenBot",
+                    text = "I need approval before running this command.",
+                    isUser = false,
+                    pendingApproval = outcome.approval
                 )
+            )
+        } else {
+            messages.add(ChatMessage("exec-${System.currentTimeMillis()}", "OpenBot", text, false))
+        }
+        return text
+    }
+
+    suspend fun ensureSandboxReady(): Boolean = withContext(Dispatchers.IO) {
+        when (rootfsManager.status.value) {
+            is SandboxStatus.Ready -> true
+            SandboxStatus.Uninitialized -> rootfsManager.initializeSandbox()
+            is SandboxStatus.SettingUp -> {
+                var attempts = 0
+                while (rootfsManager.status.value is SandboxStatus.SettingUp && attempts < 80) {
+                    kotlinx.coroutines.delay(100)
+                    attempts++
+                }
+                rootfsManager.status.value is SandboxStatus.Ready
             }
-            is ActionOutcomeData.Denied -> {
+            is SandboxStatus.Failed -> rootfsManager.initializeSandbox()
+        }
+    }
+
+    suspend fun runSandboxCommand(command: String): ActionOutcomeData = withContext(Dispatchers.IO) {
+        if (!ensureSandboxReady()) {
+            ActionOutcomeData.Error("Sandbox is not ready yet.")
+        } else {
+            OpenBotCore.requestExecute(command)
+        }
+    }
+
+    fun runAgentTurn(userText: String) {
+        if (!llmConfig.isConfigured()) {
+            messages.add(
+                ChatMessage(
+                    "cfg-${System.currentTimeMillis()}",
+                    "OpenBot",
+                    "LLM is not configured. Open Settings and set base URL, API key, and model.",
+                    false
+                )
+            )
+            return
+        }
+        isBusy = true
+        scope.launch {
+            try {
+                ensureAgentSystemPrompt()
+                agentHistory.add(LlmChatMessage("user", userText))
+                val reply = withContext(Dispatchers.IO) {
+                    LlmClient(llmConfig).chat(agentHistory.toList())
+                }
+                agentHistory.add(LlmChatMessage("assistant", reply))
+                messages.add(ChatMessage("ai-${System.currentTimeMillis()}", "OpenBot", reply, false))
+
+                val cmd = extractBashCommand(reply)
+                if (cmd != null) {
+                    messages.add(
+                        ChatMessage(
+                            "sys-${System.currentTimeMillis()}",
+                            "OpenBot",
+                            "Proposed command detected. Executing in sandbox:\n`$cmd`",
+                            false
+                        )
+                    )
+                    val outcome = runSandboxCommand(cmd)
+                    val outcomeText = appendOutcome(cmd, outcome)
+                    // Feed outcome back to LLM for explanation/follow-up, but don't auto-execute further commands.
+                    val feedback = when (outcome) {
+                        is ActionOutcomeData.Executed -> "Command executed.\n$cmd\n\nResult:\n$outcomeText"
+                        is ActionOutcomeData.NeedsApproval -> "Command requires approval in UI.\n$cmd\n\nReason: ${outcome.approval.reason}"
+                        is ActionOutcomeData.Denied -> "Command denied by policy.\n$cmd\n\nReason: ${outcome.reason}"
+                        is ActionOutcomeData.Error -> "Command execution error.\n$cmd\n\nError: ${outcome.message}"
+                    }
+                    agentHistory.add(LlmChatMessage("user", "Tool result:\n$feedback\n\nExplain the result to the user. If another command is needed, provide exactly one bash block."))
+                    val followUp = withContext(Dispatchers.IO) {
+                        LlmClient(llmConfig).chat(agentHistory.toList())
+                    }
+                    agentHistory.add(LlmChatMessage("assistant", followUp))
+                    messages.add(ChatMessage("ai2-${System.currentTimeMillis()}", "OpenBot", followUp, false))
+                }
+            } catch (e: Exception) {
                 messages.add(
                     ChatMessage(
-                        id = "deny-${System.currentTimeMillis()}",
-                        sender = "OpenBot",
-                        text = "❌ Denied: ${outcome.reason}\nCommand: `$command`",
-                        isUser = false
+                        "err-${System.currentTimeMillis()}",
+                        "OpenBot",
+                        "⚠️ Agent error: ${e.message ?: e.toString()}",
+                        false
                     )
                 )
-            }
-            is ActionOutcomeData.Error -> {
-                messages.add(
-                    ChatMessage(
-                        id = "err-${System.currentTimeMillis()}",
-                        sender = "OpenBot",
-                        text = "⚠️ Error: ${outcome.message}\nCommand: `$command`",
-                        isUser = false
-                    )
-                )
+            } finally {
+                isBusy = false
             }
         }
     }
 
-    fun submitCommand(command: String) {
-        val trimmed = command.trim()
+    fun submitInput(raw: String) {
+        val trimmed = raw.trim()
         if (trimmed.isEmpty() || isBusy) return
-        messages.add(
-            ChatMessage(
-                id = "user-${System.currentTimeMillis()}",
-                sender = "You",
-                text = trimmed,
-                isUser = true
-            )
-        )
+        messages.add(ChatMessage("user-${System.currentTimeMillis()}", "You", trimmed, true))
         inputText = ""
-        isBusy = true
-        scope.launch {
-            val outcome = withContext(Dispatchers.IO) {
-                val ready = when (rootfsManager.status.value) {
-                    is SandboxStatus.Ready -> true
-                    SandboxStatus.Uninitialized -> rootfsManager.initializeSandbox()
-                    is SandboxStatus.SettingUp -> false
-                    is SandboxStatus.Failed -> rootfsManager.initializeSandbox()
-                }
-                if (!ready) {
-                    ActionOutcomeData.Error("Sandbox is not ready yet.")
-                } else {
-                    OpenBotCore.requestExecute(trimmed)
-                }
+
+        val directCmd = when {
+            trimmed.startsWith("/sh ") -> trimmed.removePrefix("/sh ").trim()
+            trimmed.startsWith("/cmd ") -> trimmed.removePrefix("/cmd ").trim()
+            !agentMode -> trimmed
+            else -> null
+        }
+
+        if (directCmd != null) {
+            if (directCmd.isEmpty()) return
+            isBusy = true
+            scope.launch {
+                val outcome = runSandboxCommand(directCmd)
+                appendOutcome(directCmd, outcome)
+                isBusy = false
             }
-            appendOutcome(trimmed, outcome)
-            isBusy = false
+        } else {
+            runAgentTurn(trimmed)
         }
     }
 
@@ -242,7 +306,36 @@ fun OpenBotApp(rootfsManager: RootfsManager) {
             if (currentIdx != -1) {
                 messages[currentIdx] = messages[currentIdx].copy(text = statusLine, pendingApproval = null)
             }
+
+            if (agentMode && llmConfig.isConfigured()) {
+                // Feed approval resolution back to agent context.
+                agentHistory.add(LlmChatMessage("user", "Approval resolution for `${approval.command}`:\n$statusLine\n\nExplain the result. If another command is needed, provide exactly one bash block."))
+                isBusy = true
+                try {
+                    val followUp = withContext(Dispatchers.IO) { LlmClient(llmConfig).chat(agentHistory.toList()) }
+                    agentHistory.add(LlmChatMessage("assistant", followUp))
+                    messages.add(ChatMessage("ai-appr-${System.currentTimeMillis()}", "OpenBot", followUp, false))
+                } catch (e: Exception) {
+                    messages.add(ChatMessage("ai-appr-err-${System.currentTimeMillis()}", "OpenBot", "⚠️ Agent error: ${e.message}", false))
+                } finally {
+                    isBusy = false
+                }
+            }
         }
+    }
+
+    if (showSettings) {
+        SettingsDialog(
+            initial = llmConfig,
+            onDismiss = { showSettings = false },
+            onSave = { cfg ->
+                llmConfig = cfg
+                settingsStore.save(cfg)
+                ensureAgentSystemPrompt()
+                showSettings = false
+                messages.add(ChatMessage("cfg-save-${System.currentTimeMillis()}", "OpenBot", "Settings saved.", false))
+            }
+        )
     }
 
     Scaffold(
@@ -257,40 +350,55 @@ fun OpenBotApp(rootfsManager: RootfsManager) {
                             is SandboxStatus.Ready -> if (OpenBotCore.isNativeLoaded()) "Native core ready • PRoot sandbox" else "Mock core ready • Native lib unavailable"
                             is SandboxStatus.Failed -> "Sandbox failed"
                         }
-                        Text(
-                            statusText,
-                            fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.primary
-                        )
+                        Text(statusText, fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
                     }
                 },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant
-                )
+                actions = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Agent", fontSize = 12.sp)
+                        Switch(
+                            checked = agentMode,
+                            onCheckedChange = { agentMode = it },
+                            modifier = Modifier.padding(horizontal = 4.dp)
+                        )
+                        TextButton(onClick = { showSettings = true }) { Text("Settings") }
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
             )
         },
         bottomBar = {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                OutlinedTextField(
-                    value = inputText,
-                    onValueChange = { inputText = it },
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("Ask your coworker / run command...") },
-                    singleLine = true,
-                    shape = RoundedCornerShape(24.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Button(
-                    onClick = { submitCommand(inputText) },
-                    enabled = !isBusy,
-                    shape = RoundedCornerShape(24.dp)
+            Column {
+                if (agentMode && !llmConfig.isConfigured()) {
+                    Text(
+                        "Agent mode on but LLM not configured.",
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp),
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(if (isBusy) "..." else "Send")
+                    OutlinedTextField(
+                        value = inputText,
+                        onValueChange = { inputText = it },
+                        modifier = Modifier.weight(1f),
+                        placeholder = { Text(if (agentMode) "Ask your AI coworker..." else "Run command in sandbox...") },
+                        singleLine = true,
+                        shape = RoundedCornerShape(24.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = { submitInput(inputText) },
+                        enabled = !isBusy,
+                        shape = RoundedCornerShape(24.dp)
+                    ) {
+                        Text(if (isBusy) "..." else "Send")
+                    }
                 }
             }
         }
@@ -304,13 +412,52 @@ fun OpenBotApp(rootfsManager: RootfsManager) {
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             items(messages, key = { it.id }) { msg ->
-                MessageBubble(
-                    message = msg,
-                    onResolveApproval = { approved -> resolveApproval(msg, approved) }
-                )
+                MessageBubble(message = msg, onResolveApproval = { approved -> resolveApproval(msg, approved) })
             }
         }
     }
+}
+
+@Composable
+fun SettingsDialog(
+    initial: LlmConfig,
+    onDismiss: () -> Unit,
+    onSave: (LlmConfig) -> Unit
+) {
+    var baseUrl by remember { mutableStateOf(initial.baseUrl) }
+    var apiKey by remember { mutableStateOf(initial.apiKey) }
+    var model by remember { mutableStateOf(initial.model) }
+    var systemPrompt by remember { mutableStateOf(initial.systemPrompt) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Agent LLM Settings") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(value = baseUrl, onValueChange = { baseUrl = it }, label = { Text("Base URL") }, singleLine = true)
+                OutlinedTextField(value = apiKey, onValueChange = { apiKey = it }, label = { Text("API Key") }, singleLine = true)
+                OutlinedTextField(value = model, onValueChange = { model = it }, label = { Text("Model") }, singleLine = true)
+                OutlinedTextField(
+                    value = systemPrompt,
+                    onValueChange = { systemPrompt = it },
+                    label = { Text("System prompt") },
+                    minLines = 3,
+                    maxLines = 6
+                )
+                Text(
+                    "OpenAI-compatible /chat/completions endpoint. Key stored in app private SharedPreferences.",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                onSave(LlmConfig(baseUrl = baseUrl, apiKey = apiKey, model = model, systemPrompt = systemPrompt))
+            }) { Text("Save") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
 }
 
 @Composable

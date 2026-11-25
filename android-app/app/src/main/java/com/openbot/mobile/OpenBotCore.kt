@@ -25,6 +25,7 @@ sealed class ActionOutcomeData {
 
 object OpenBotCore {
     private var nativeLoaded = false
+    private val mockPending = linkedMapOf<String, PendingApprovalData>()
 
     init {
         nativeLoaded = try {
@@ -59,8 +60,12 @@ object OpenBotCore {
 
     fun resolveApproval(approvalId: String, approved: Boolean): ActionOutcomeData {
         if (!nativeLoaded) {
+            val pending = mockPending.remove(approvalId)
+            if (pending == null) {
+                return ActionOutcomeData.Error("Approval not found: $approvalId")
+            }
             return if (approved) {
-                ActionOutcomeData.Executed(ExecutionResultData(0, "Approved & executed (mock).", ""))
+                mockRunCommand(pending.command)
             } else {
                 ActionOutcomeData.Denied("Rejected by reviewer.")
             }
@@ -73,10 +78,23 @@ object OpenBotCore {
     }
 
     fun listPendingApprovals(): List<PendingApprovalData> {
-        if (!nativeLoaded) return emptyList()
+        if (!nativeLoaded) return mockPending.values.toList()
         return try {
             val raw = nativeListPendingApprovals()
-            val arr = JSONArray(raw)
+            val trimmed = raw.trim()
+            if (trimmed.startsWith("{")) {
+                val obj = JSONObject(trimmed)
+                if (obj.has("error")) return emptyList()
+                return listOf(
+                    PendingApprovalData(
+                        id = obj.optString("id"),
+                        command = obj.optString("command"),
+                        reason = obj.optString("reason"),
+                        riskDescription = obj.optString("risk_description")
+                    )
+                )
+            }
+            val arr = JSONArray(trimmed)
             buildList {
                 for (i in 0 until arr.length()) {
                     val obj = arr.getJSONObject(i)
@@ -97,32 +115,40 @@ object OpenBotCore {
 
     private fun mockExecute(command: String): ActionOutcomeData {
         val trimmed = command.trim()
-        if (trimmed.contains("rm -rf /") || trimmed.contains(":(){ :|:& };:")) {
+        if (trimmed.contains("rm -rf /") || trimmed.contains(":(){ :|:& };:") || trimmed.contains("mkfs")) {
             return ActionOutcomeData.Denied("Blocked by policy (mock).")
         }
-        if (trimmed.contains("curl") || trimmed.contains("wget") || trimmed.contains("ssh")) {
-            return ActionOutcomeData.NeedsApproval(
-                PendingApprovalData(
-                    id = "mock_${System.currentTimeMillis()}",
-                    command = trimmed,
-                    reason = "External network access requires approval",
-                    riskDescription = "High"
-                )
+        if (trimmed.contains("curl") || trimmed.contains("wget") || trimmed.contains("ssh") || trimmed.contains("nc ")) {
+            return mockNeedsApproval(trimmed, "External/network command requires approval", "High")
+        }
+        if (trimmed.startsWith("rm ") || trimmed.startsWith("mv ") || trimmed.contains("chmod 777")) {
+            return mockNeedsApproval(trimmed, "Potentially destructive command requires approval", "Medium")
+        }
+        return mockRunCommand(trimmed)
+    }
+
+    private fun mockNeedsApproval(command: String, reason: String, risk: String): ActionOutcomeData {
+        val id = "mock_${System.currentTimeMillis()}_${mockPending.size}"
+        val approval = PendingApprovalData(id, command, reason, risk)
+        mockPending[id] = approval
+        return ActionOutcomeData.NeedsApproval(approval)
+    }
+
+    private fun mockRunCommand(command: String): ActionOutcomeData {
+        // Best-effort local mock execution for basic shell commands when native lib is unavailable.
+        return try {
+            val process = ProcessBuilder(listOf("/system/bin/sh", "-c", command))
+                .redirectErrorStream(false)
+                .start()
+            val stdout = process.inputStream.bufferedReader().readText()
+            val stderr = process.errorStream.bufferedReader().readText()
+            val exit = process.waitFor()
+            ActionOutcomeData.Executed(ExecutionResultData(exit, stdout, stderr))
+        } catch (e: Exception) {
+            ActionOutcomeData.Executed(
+                ExecutionResultData(0, "Mock execution (no shell): $command", e.message ?: "")
             )
         }
-        if (trimmed.startsWith("rm ")) {
-            return ActionOutcomeData.NeedsApproval(
-                PendingApprovalData(
-                    id = "mock_${System.currentTimeMillis()}",
-                    command = trimmed,
-                    reason = "File deletion requires approval",
-                    riskDescription = "Medium"
-                )
-            )
-        }
-        return ActionOutcomeData.Executed(
-            ExecutionResultData(0, "Mock execution: $trimmed", "")
-        )
     }
 
     private fun parseOutcomeJson(jsonStr: String): ActionOutcomeData {

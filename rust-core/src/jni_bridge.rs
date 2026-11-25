@@ -88,7 +88,16 @@ pub extern "system" fn Java_com_openbot_mobile_OpenBotCore_nativeResolveApproval
                 .unwrap_or_else(|_| "{\"error\":\"Serialization error\"}".to_string());
             env.new_string(json).map(|s| s.into_raw()).unwrap_or_else(|_| std::ptr::null_mut())
         }
-        Err(e) => create_error_json(&mut env, &e.to_string()),
+        Err(e) => {
+            let outcome = match e {
+                crate::engine::EngineError::ActionDenied(reason) => ActionOutcome::Denied { reason },
+                crate::engine::EngineError::ApprovalNotFound(_) => ActionOutcome::Denied { reason: e.to_string() },
+                other => return create_error_json(&mut env, &other.to_string()),
+            };
+            let json = serde_json::to_string(&outcome)
+                .unwrap_or_else(|_| "{\"error\":\"Serialization error\"}".to_string());
+            env.new_string(json).map(|s| s.into_raw()).unwrap_or_else(|_| std::ptr::null_mut())
+        }
     }
 }
 

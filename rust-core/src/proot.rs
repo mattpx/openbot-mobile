@@ -45,7 +45,8 @@ impl PRootConfig {
     }
 
     pub fn with_binding<P: AsRef<Path>>(mut self, host_path: P, guest_path: &str) -> Self {
-        self.extra_bindings.push((host_path.as_ref().to_path_buf(), guest_path.to_string()));
+        self.extra_bindings
+            .push((host_path.as_ref().to_path_buf(), guest_path.to_string()));
         self
     }
 }
@@ -111,17 +112,48 @@ impl PRootExecutor {
         args
     }
 
-    /// Executes a shell command inside the PRoot sandbox.
+    /// Detects whether the configured proot binary is a shim/fallback script
+    /// rather than a real proot binary. Shims cannot parse proot-style args.
+    fn is_shim(&self) -> bool {
+        std::fs::read_to_string(&self.config.proot_path)
+            .map(|s| s.contains("OPENBOT_SHIM"))
+            .unwrap_or(false)
+    }
+
+    /// Executes a shell command inside the sandbox.
+    /// Uses real proot when available; falls back to direct execution via sh
+    /// in workspace dir when the proot path is an OpenBot shim.
     pub fn execute(&self, command_str: &str) -> Result<ExecutionResult, SandboxError> {
         self.validate()?;
 
-        let args = self.build_args(command_str);
-        let output = Command::new(&self.config.proot_path)
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| SandboxError::ExecutionFailed(e.to_string()))?;
+        let output = if self.is_shim() {
+            // Shim mode: execute directly with /system/bin/sh or sh in workspace.
+            // This is a degraded sandbox (no rootfs isolation) but keeps commands working.
+            let shell = if Path::new("/system/bin/sh").exists() {
+                "/system/bin/sh"
+            } else {
+                "/bin/sh"
+            };
+            Command::new(shell)
+                .arg("-c")
+                .arg(command_str)
+                .current_dir(&self.config.workspace_path)
+                .env("HOME", self.config.workspace_path.to_string_lossy().as_ref())
+                .env("TMPDIR", self.config.rootfs_path.join("tmp").to_string_lossy().as_ref())
+                .env("PATH", "/system/bin:/system/xbin:/vendor/bin:/usr/bin:/bin")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(|e| SandboxError::ExecutionFailed(e.to_string()))?
+        } else {
+            let args = self.build_args(command_str);
+            Command::new(&self.config.proot_path)
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(|e| SandboxError::ExecutionFailed(e.to_string()))?
+        };
 
         Ok(ExecutionResult {
             exit_code: output.status.code().unwrap_or(-1),
@@ -161,9 +193,13 @@ mod tests {
 
     #[test]
     fn test_validation_fails_on_missing_paths() {
-        let config = PRootConfig::new("/nonexistent/proot", "/nonexistent/rootfs", "/nonexistent/ws");
+        let config =
+            PRootConfig::new("/nonexistent/proot", "/nonexistent/rootfs", "/nonexistent/ws");
         let executor = PRootExecutor::new(config);
-        assert!(matches!(executor.validate(), Err(SandboxError::BinaryNotFound(_))));
+        assert!(matches!(
+            executor.validate(),
+            Err(SandboxError::BinaryNotFound(_))
+        ));
     }
 
     #[test]
@@ -179,5 +215,29 @@ mod tests {
         let config = PRootConfig::new(&proot_file, &rootfs, &ws);
         let executor = PRootExecutor::new(config);
         assert!(executor.validate().is_ok());
+    }
+
+    #[test]
+    fn test_shim_mode_executes_directly() {
+        let temp = tempdir().unwrap();
+        let proot_file = temp.path().join("proot");
+        std::fs::write(&proot_file, b"#!/bin/sh\n# OPENBOT_SHIM\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&proot_file).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&proot_file, perms).unwrap();
+        }
+        let rootfs = temp.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("tmp")).unwrap();
+        let ws = temp.path().join("workspace");
+        std::fs::create_dir(&ws).unwrap();
+
+        let config = PRootConfig::new(&proot_file, &rootfs, &ws);
+        let executor = PRootExecutor::new(config);
+        let result = executor.execute("echo hello-shim").unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stdout.contains("hello-shim"));
     }
 }

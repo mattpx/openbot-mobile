@@ -1,14 +1,13 @@
 package com.openbot.mobile
 
 import android.content.Context
+import android.os.Build
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
 
 sealed class SandboxStatus {
     object Uninitialized : SandboxStatus()
@@ -31,21 +30,16 @@ class RootfsManager(private val context: Context) {
         try {
             _status.value = SandboxStatus.SettingUp("Checking PRoot environment...", 0.1f)
 
-            // Setup proot binary if missing
             if (!prootBin.exists() || prootBin.length() == 0L) {
                 _status.value = SandboxStatus.SettingUp("Installing PRoot engine...", 0.3f)
                 installProotBinary()
             }
-
-            // Ensure executable permissions
             prootBin.setExecutable(true, false)
             prootBin.setReadable(true, false)
 
-            // Setup rootfs base directories
             _status.value = SandboxStatus.SettingUp("Configuring rootfs filesystem...", 0.6f)
             ensureMinimalRootfsStructure()
 
-            // Initialize OpenBot Rust Core Engine
             _status.value = SandboxStatus.SettingUp("Starting OpenBot core engine...", 0.9f)
             val initialized = OpenBotCore.initEngine(
                 prootPath = prootBin.absolutePath,
@@ -71,31 +65,60 @@ class RootfsManager(private val context: Context) {
     }
 
     private fun installProotBinary() {
-        // Look for bundled asset or copy standard proot
-        try {
-            context.assets.open("proot").use { input ->
-                FileOutputStream(prootBin).use { output ->
-                    input.copyTo(output)
+        val assetName = preferredProotAsset()
+        val candidates = listOfNotNull(assetName, "proot", "proot-${abi()}")
+        for (name in candidates) {
+            try {
+                context.assets.open(name).use { input ->
+                    FileOutputStream(prootBin).use { output -> input.copyTo(output) }
                 }
+                prootBin.setExecutable(true, false)
+                if (prootBin.length() > 0L) return
+            } catch (_: Exception) {
+                // try next candidate
             }
-        } catch (e: Exception) {
-            // Create fallback wrapper script if asset not bundled
-            prootBin.writeText("#!/bin/sh\nexec \"$@\"\n")
         }
+
+        // Fallback shim. Rust proot.rs detects OPENBOT_SHIM and executes via system sh.
+        prootBin.writeText(
+            """
+            #!/system/bin/sh
+            # OPENBOT_SHIM
+            # Real proot binary not bundled; Rust engine will fall back to direct shell execution.
+            exec "$@"
+            """.trimIndent() + "\n"
+        )
         prootBin.setExecutable(true, false)
     }
 
-    private fun ensureMinimalRootfsStructure() {
-        // Ensure standard Linux root directories exist
-        val dirs = listOf("bin", "etc", "dev", "proc", "sys", "tmp", "usr/bin", "workspace")
-        for (dir in dirs) {
-            File(rootfsDir, dir).mkdirs()
+    private fun preferredProotAsset(): String? {
+        return when (abi()) {
+            "arm64-v8a" -> "proot-arm64"
+            "x86_64" -> "proot-x86_64"
+            "armeabi-v7a" -> "proot-arm"
+            else -> null
         }
+    }
 
-        // Install minimal sh fallback
+    private fun abi(): String = Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"
+
+    private fun ensureMinimalRootfsStructure() {
+        val dirs = listOf("bin", "etc", "dev", "proc", "sys", "tmp", "usr/bin", "workspace", "home")
+        for (dir in dirs) File(rootfsDir, dir).mkdirs()
+
+        // Minimal /etc files for tools that expect them
+        val passwd = File(rootfsDir, "etc/passwd")
+        if (!passwd.exists()) passwd.writeText("root:x:0:0:root:/workspace:/bin/sh\n")
+        val hosts = File(rootfsDir, "etc/hosts")
+        if (!hosts.exists()) hosts.writeText("127.0.0.1 localhost\n")
+
+        // Marker for diagnostics
+        File(rootfsDir, "etc/openbot-rootfs").writeText("openbot-mobile-minimal-rootfs\n")
+
+        // Symlink-ish sh helper is not reliable on Android; just place a script.
         val shFile = File(rootfsDir, "bin/sh")
         if (!shFile.exists()) {
-            shFile.writeText("#!/bin/sh\nexec /bin/sh \"$@\"\n")
+            shFile.writeText("#!/system/bin/sh\nexec /system/bin/sh \"$@\"\n")
             shFile.setExecutable(true, false)
         }
     }
