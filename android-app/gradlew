@@ -1,9 +1,5 @@
 #!/bin/sh
 
-# Gradle wrapper POSIX script
-APP_NAME="Gradle"
-APP_BASE_NAME=`basename "$0"`
-
 # Resolve symlinks
 PRG="$0"
 while [ -h "$PRG" ] ; do
@@ -20,9 +16,11 @@ cd "`dirname \"$PRG\"`/" >/dev/null
 APP_HOME="`pwd -P`"
 cd "$SAVED" >/dev/null
 
-CLASSPATH=$APP_HOME/gradle/wrapper/gradle-wrapper.jar
+APP_NAME="Gradle"
+APP_BASE_NAME=`basename "$0"`
+CLASSPATH="$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
 
-# Determine the Java command to use to start the JVM.
+# Determine Java command
 if [ -n "$JAVA_HOME" ] ; then
     if [ -x "$JAVA_HOME/jre/sh/java" ] ; then
         JAVACMD="$JAVA_HOME/jre/sh/java"
@@ -33,4 +31,11 @@ else
     JAVACMD="java"
 fi
 
-exec "$JAVACMD" "-Dorg.gradle.appname=$APP_BASE_NAME" -classpath "$CLASSPATH" org.gradle.wrapper.GradleWrapperMain "$@"
+if [ -f "$CLASSPATH" ]; then
+    exec "$JAVACMD" "-Dorg.gradle.appname=$APP_BASE_NAME" -classpath "$CLASSPATH" org.gradle.wrapper.GradleWrapperMain "$@"
+elif command -v gradle >/dev/null 2>&1; then
+    exec gradle "$@"
+else
+    echo "ERROR: gradle-wrapper.jar not found and gradle command not installed." >&2
+    exit 1
+fi
