@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "proot": {
+    "arm64-v8a": {
+      "asset": "sandbox/proot-arm64",
+      "sha256": "db1777ae6e1cd67164360b7f4f22042de98406a1a1141453962521c134ff4a0a",
+      "version": "5.1.107-a179d3e",
+      "source": "https://github.com/ahmed-alnassif/proot/releases/tag/v26.10.08-a179d3e",
+      "license": "GPL-2.0-or-later"
+    },
+    "x86_64": {
+      "asset": "sandbox/proot-x86_64",
+      "sha256": "c2464beb160ff54b351dcef84311d2a38dcda21fba92f486b8bf12cf50ddd8d6",
+      "version": "5.1.107-a179d3e",
+      "source": "https://github.com/ahmed-alnassif/proot/releases/tag/v26.10.08-a179d3e",
+      "license": "GPL-2.0-or-later"
+    },
+    "armeabi-v7a": {
+      "asset": "sandbox/proot-arm",
+      "sha256": "d7d3c974280b16b1ef7c7e48bf2d624dbff1098937eb980699d375d8ba6c6546",
+      "version": "5.1.107-a179d3e",
+      "source": "https://github.com/ahmed-alnassif/proot/releases/tag/v26.10.08-a179d3e",
+      "license": "GPL-2.0-or-later"
+    }
+  },
+  "rootfs": {}
+}
