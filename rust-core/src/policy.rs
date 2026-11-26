@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum RiskLevel {
     Low,
     Medium,
@@ -114,27 +114,40 @@ impl PolicyEngine {
     /// Deny rules take precedence over approval rules.
     pub fn evaluate_shell_command(&self, command: &str) -> PolicyDecision {
         let trimmed = command.trim();
-        let mut approval: Option<(String, RiskLevel)> = None;
+        let matches: Vec<&PolicyRule> = self
+            .rules
+            .iter()
+            .filter(|rule| pattern_matches(trimmed, &rule.pattern))
+            .collect();
 
-        for rule in &self.rules {
-            if pattern_matches(trimmed, &rule.pattern) {
-                match &rule.action {
-                    PolicyAction::AlwaysDeny => {
-                        return PolicyDecision::Deny {
-                            reason: rule.description.clone(),
-                        };
+        // Deny always wins, even when an earlier rule allows the same command.
+        // A single-pass early return would let `ls && rm -rf /` through if an
+        // AlwaysAllow rule for `ls` was registered before the deny rule.
+        if let Some(rule) = matches
+            .iter()
+            .find(|rule| matches!(&rule.action, PolicyAction::AlwaysDeny))
+        {
+            return PolicyDecision::Deny {
+                reason: rule.description.clone(),
+            };
+        }
+
+        // Approval rules take precedence over allow rules so commands like
+        // `ls && curl ...` or `echo ok && rm file` cannot bypass human approval.
+        // When multiple approval rules match, choose the one with the highest risk.
+        let mut highest_approval: Option<(String, RiskLevel)> = None;
+        for rule in &matches {
+            if let PolicyAction::AskHuman(risk) = &rule.action {
+                match &highest_approval {
+                    Some((_, current_risk)) if current_risk >= risk => {}
+                    _ => {
+                        highest_approval = Some((rule.description.clone(), *risk));
                     }
-                    PolicyAction::AskHuman(risk) => {
-                        if approval.is_none() {
-                            approval = Some((rule.description.clone(), *risk));
-                        }
-                    }
-                    PolicyAction::AlwaysAllow => return PolicyDecision::Allow,
                 }
             }
         }
 
-        if let Some((reason, risk)) = approval {
+        if let Some((reason, risk)) = highest_approval {
             return PolicyDecision::RequireApproval {
                 approval_id: format!("appr_{}", generate_short_id()),
                 reason,
@@ -267,6 +280,55 @@ mod tests {
         // contains both "curl" (approval) and "rm -rf /" (deny)
         let decision = engine.evaluate_shell_command("curl http://x && rm -rf /");
         assert!(matches!(decision, PolicyDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn test_deny_takes_precedence_over_earlier_allow_rule() {
+        let mut engine = PolicyEngine::new_standard();
+        // An earlier broad allow must not hide a deny rule registered later.
+        engine.add_rule(PolicyRule {
+            pattern: "ls".to_string(),
+            action: PolicyAction::AlwaysAllow,
+            description: "test allow".to_string(),
+        });
+        engine.add_rule(PolicyRule {
+            pattern: "mkfs".to_string(),
+            action: PolicyAction::AlwaysDeny,
+            description: "test deny".to_string(),
+        });
+        let decision = engine.evaluate_shell_command("ls && mkfs.ext4 /dev/sda");
+        assert!(matches!(decision, PolicyDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn test_approval_takes_precedence_over_earlier_allow_rule() {
+        let mut engine = PolicyEngine::new_standard();
+        // An allow rule for `ls` must not bypass approval for `curl`
+        engine.add_rule(PolicyRule {
+            pattern: "ls".to_string(),
+            action: PolicyAction::AlwaysAllow,
+            description: "test allow".to_string(),
+        });
+        let decision = engine.evaluate_shell_command("ls && curl https://example.com");
+        match decision {
+            PolicyDecision::RequireApproval { risk, .. } => {
+                assert_eq!(risk, RiskLevel::High);
+            }
+            _ => panic!("Expected RequireApproval for command containing curl"),
+        }
+    }
+
+    #[test]
+    fn test_approval_picks_highest_risk_level() {
+        let engine = PolicyEngine::new_standard();
+        // rm has Medium risk, curl has High risk
+        let decision = engine.evaluate_shell_command("rm /tmp/foo && curl https://example.com");
+        match decision {
+            PolicyDecision::RequireApproval { risk, .. } => {
+                assert_eq!(risk, RiskLevel::High);
+            }
+            _ => panic!("Expected RequireApproval with High risk"),
+        }
     }
 
     // --- regression: pattern matching edge cases ---
