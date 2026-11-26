@@ -5,6 +5,11 @@ import android.util.Log
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.FileVisitResult
+import java.nio.file.SimpleFileVisitor
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
@@ -167,7 +172,7 @@ class SandboxAssets(private val context: Context) {
             return "Cannot create rootfs directory"
         }
 
-        val listing = runProcess(listOf(tar, "-tzf", archive.absolutePath), 60)
+        val listing = runProcess(listOf(tar, "-tzf", archive.absolutePath), 60, LISTING_MAX_CHARS)
             ?: return "Timed out while listing the rootfs archive"
         if (listing.exitCode != 0) {
             return "tar listing failed: ${listing.output.take(300)}"
@@ -184,6 +189,24 @@ class SandboxAssets(private val context: Context) {
             return "Rootfs archive contains an unsafe path: ${unsafeEntry.take(120)}"
         }
 
+        // A safe entry name is not enough: a symlink entry can point outside the
+        // rootfs and make a later, otherwise safe, entry write outside it.
+        val links = runProcess(listOf(tar, "-tvzf", archive.absolutePath), 60, LISTING_MAX_CHARS)
+            ?: return "Timed out while listing rootfs archive links"
+        if (links.exitCode != 0) {
+            return "tar link listing failed: ${links.output.take(300)}"
+        }
+        val rootPath = rootfsDir.toPath().normalize()
+        val unsafeLink = links.output.lineSequence()
+            .mapNotNull { line -> LINK_TARGET_REGEX.find(line.trim())?.groupValues }
+            .firstOrNull { groups ->
+                val linkPath = rootPath.resolve(groups[1].trim().substringAfterLast(' ').trim())
+                unsafeLinkTarget(rootPath, linkPath, groups[2]) != null
+            }
+        if (unsafeLink != null) {
+            return "Rootfs archive contains an unsafe link target: ${unsafeLink[2].take(120)}"
+        }
+
         val extraction = runProcess(
             listOf(tar, "-xzf", archive.absolutePath, "-C", rootfsDir.absolutePath),
             180
@@ -191,7 +214,39 @@ class SandboxAssets(private val context: Context) {
         if (extraction.exitCode != 0) {
             return "tar extraction failed: ${extraction.output.take(300)}"
         }
+        val escaped = findEscapingSymlink(rootPath)
+        if (escaped != null) {
+            return "Rootfs extraction created an unsafe symlink: ${escaped.take(120)}"
+        }
         return null
+    }
+
+    /** Rejects absolute targets and targets that resolve outside the rootfs. */
+    private fun unsafeLinkTarget(root: Path, link: Path, rawTarget: String): String? {
+        val target = rawTarget.trim()
+        if (target.isEmpty()) return null
+        val resolved = if (target.startsWith("/")) {
+            root.resolve(target.removePrefix("/"))
+        } else {
+            (link.parent ?: root).resolve(target)
+        }
+        return if (resolved.normalize().startsWith(root.normalize())) null else target
+    }
+
+    private fun findEscapingSymlink(root: Path): String? {
+        val found = arrayOfNulls<String>(1)
+        Files.walkFileTree(root.normalize(), object : SimpleFileVisitor<Path>() {
+            override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                if (attrs.isSymbolicLink && found[0] == null) {
+                    val target = runCatching { Files.readSymbolicLink(file).toString() }.getOrNull()
+                    if (target != null && unsafeLinkTarget(root, file, target) != null) {
+                        found[0] = "$file -> $target"
+                    }
+                }
+                return FileVisitResult.CONTINUE
+            }
+        })
+        return found[0]
     }
 
     fun sha256(file: File): String? {
@@ -241,7 +296,11 @@ class SandboxAssets(private val context: Context) {
 
     private data class ProcessResult(val exitCode: Int, val output: String)
 
-    private fun runProcess(command: List<String>, timeoutSeconds: Long): ProcessResult? {
+    private fun runProcess(
+        command: List<String>,
+        timeoutSeconds: Long,
+        maxChars: Int = 4000
+    ): ProcessResult? {
         val logFile = File.createTempFile("openbot-process-", ".log", context.cacheDir)
         return try {
             val process = ProcessBuilder(command)
@@ -253,7 +312,7 @@ class SandboxAssets(private val context: Context) {
                 process.destroyForcibly()
                 null
             } else {
-                ProcessResult(process.exitValue(), logFile.readText().take(4000))
+                ProcessResult(process.exitValue(), logFile.readText().take(maxChars))
             }
         } catch (e: Exception) {
             Log.w(TAG, "Process failed: $command", e)
@@ -273,6 +332,8 @@ class SandboxAssets(private val context: Context) {
 
     private companion object {
         const val TAG = "SandboxAssets"
+        const val LISTING_MAX_CHARS = 1_000_000
+        val LINK_TARGET_REGEX = Regex("^(.*?)(?: -> | link to )(.+)$")
         val ELF_MAGIC = byteArrayOf(
             0x7f.toByte(),
             'E'.code.toByte(),

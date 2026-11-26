@@ -103,6 +103,8 @@ fun OpenBotApp(rootfsManager: RootfsManager, settingsStore: AgentSettingsStore) 
         )
     }
     val agentHistory = remember { mutableStateListOf<LlmChatMessage>() }
+    // A pending approval bubble can be clicked twice before recomposition removes it.
+    val resolvingApprovals = remember { mutableSetOf<String>() }
 
     fun ensureAgentSystemPrompt() {
         if (agentHistory.none { it.role == "system" }) {
@@ -121,7 +123,7 @@ fun OpenBotApp(rootfsManager: RootfsManager, settingsStore: AgentSettingsStore) 
                 val s = rootfsManager.status.value as? SandboxStatus.Ready
                 val mode = s?.mode ?: OpenBotCore.sandboxMode()
                 buildString {
-                    append("Sandbox ready (mode=$mode, rootfs=${s?.rootfsKind ?: "unknown"}")
+                    append("Sandbox ready (mode=$mode, rootfs=${s?.rootfsKind ?: "unknown"})")
                     if (!s?.prootVersion.isNullOrBlank()) append(", proot=${s?.prootVersion}")
                     append(").")
                     if (!s?.warning.isNullOrBlank()) {
@@ -205,6 +207,66 @@ fun OpenBotApp(rootfsManager: RootfsManager, settingsStore: AgentSettingsStore) 
         }
     }
 
+    /** Shared bounded agent loop, used both for chat turns and approval follow-ups. */
+    suspend fun runAgentLoop(idPrefix: String) {
+        var steps = 0
+        var hitLimit = true
+        while (steps < MAX_AGENT_STEPS) {
+            val reply = withContext(Dispatchers.IO) {
+                LlmClient(llmConfig).chat(agentHistory.toList())
+            }
+            agentHistory.add(LlmChatMessage("assistant", reply))
+            val parsed = parseAgentReply(reply)
+            messages.add(ChatMessage("$idPrefix-${System.currentTimeMillis()}-$steps", "OpenBot", parsed.text, false))
+
+            val cmd = parsed.command
+            if (cmd == null) {
+                hitLimit = false
+                break
+            }
+            messages.add(
+                ChatMessage(
+                    "sys-$idPrefix-${System.currentTimeMillis()}-$steps",
+                    "OpenBot",
+                    "Proposed command detected. Executing in sandbox:\n`$cmd`",
+                    false
+                )
+            )
+            val outcome = runSandboxCommand(cmd)
+            val outcomeText = appendOutcome(cmd, outcome)
+            val feedback = when (outcome) {
+                is ActionOutcomeData.Executed -> "Command executed.\n$cmd\n\nResult:\n$outcomeText"
+                is ActionOutcomeData.NeedsApproval ->
+                    "Command requires approval in UI.\n$cmd\n\nReason: ${outcome.approval.reason}\n" +
+                        "Stop here; the user will approve or reject in the UI."
+                is ActionOutcomeData.Denied -> "Command denied by policy.\n$cmd\n\nReason: ${outcome.reason}"
+                is ActionOutcomeData.Error -> "Command execution error.\n$cmd\n\nError: ${outcome.message}"
+            }
+            agentHistory.add(
+                LlmChatMessage(
+                    "user",
+                    "Tool result:\n$feedback\n\nExplain the result to the user. If another command is needed, provide exactly one bash block."
+                )
+            )
+            steps++
+            // Approval requires a human decision in the UI; stop this loop.
+            if (outcome is ActionOutcomeData.NeedsApproval) {
+                hitLimit = false
+                break
+            }
+        }
+        if (hitLimit) {
+            messages.add(
+                ChatMessage(
+                    "limit-$idPrefix-${System.currentTimeMillis()}",
+                    "OpenBot",
+                    "⚠️ Reached the agent step limit ($MAX_AGENT_STEPS). Ask me to continue if needed.",
+                    false
+                )
+            )
+        }
+    }
+
     fun runAgentTurn(userText: String) {
         if (!llmConfig.isConfigured()) {
             messages.add(
@@ -222,51 +284,7 @@ fun OpenBotApp(rootfsManager: RootfsManager, settingsStore: AgentSettingsStore) 
             try {
                 ensureAgentSystemPrompt()
                 agentHistory.add(LlmChatMessage("user", userText))
-                var steps = 0
-                while (steps < MAX_AGENT_STEPS) {
-                    val reply = withContext(Dispatchers.IO) {
-                        LlmClient(llmConfig).chat(agentHistory.toList())
-                    }
-                    agentHistory.add(LlmChatMessage("assistant", reply))
-                    val parsed = parseAgentReply(reply)
-                    messages.add(ChatMessage("ai-${System.currentTimeMillis()}-$steps", "OpenBot", parsed.text, false))
-
-                    val cmd = parsed.command ?: break
-                    messages.add(
-                        ChatMessage(
-                            "sys-${System.currentTimeMillis()}-$steps",
-                            "OpenBot",
-                            "Proposed command detected. Executing in sandbox:\n`$cmd`",
-                            false
-                        )
-                    )
-                    val outcome = runSandboxCommand(cmd)
-                    val outcomeText = appendOutcome(cmd, outcome)
-
-                    val feedback = when (outcome) {
-                        is ActionOutcomeData.Executed -> "Command executed.\n$cmd\n\nResult:\n$outcomeText"
-                        is ActionOutcomeData.NeedsApproval ->
-                            "Command requires approval in UI.\n$cmd\n\nReason: ${outcome.approval.reason}\n" +
-                                "Stop here; the user will approve or reject in the UI."
-                        is ActionOutcomeData.Denied -> "Command denied by policy.\n$cmd\n\nReason: ${outcome.reason}"
-                        is ActionOutcomeData.Error -> "Command execution error.\n$cmd\n\nError: ${outcome.message}"
-                    }
-                    agentHistory.add(LlmChatMessage("user", "Tool result:\n$feedback\n\nExplain the result to the user. If another command is needed, provide exactly one bash block."))
-                    steps++
-
-                    // Approval requires a human decision in the UI; stop the loop.
-                    if (outcome is ActionOutcomeData.NeedsApproval) break
-                }
-                if (steps >= MAX_AGENT_STEPS) {
-                    messages.add(
-                        ChatMessage(
-                            "limit-${System.currentTimeMillis()}",
-                            "OpenBot",
-                            "⚠️ Reached the agent step limit ($MAX_AGENT_STEPS). Ask me to continue if needed.",
-                            false
-                        )
-                    )
-                }
+                runAgentLoop("ai")
             } catch (e: Exception) {
                 messages.add(
                     ChatMessage(
@@ -285,8 +303,6 @@ fun OpenBotApp(rootfsManager: RootfsManager, settingsStore: AgentSettingsStore) 
     fun submitInput(raw: String) {
         val trimmed = raw.trim()
         if (trimmed.isEmpty() || isBusy) return
-        messages.add(ChatMessage("user-${System.currentTimeMillis()}", "You", trimmed, true))
-        inputText = ""
 
         val directCmd = when {
             trimmed.startsWith("/sh ") -> trimmed.removePrefix("/sh ").trim()
@@ -294,9 +310,12 @@ fun OpenBotApp(rootfsManager: RootfsManager, settingsStore: AgentSettingsStore) 
             !agentMode -> trimmed
             else -> null
         }
+        if (directCmd?.isEmpty() == true) return
+
+        messages.add(ChatMessage("user-${System.currentTimeMillis()}", "You", trimmed, true))
+        inputText = ""
 
         if (directCmd != null) {
-            if (directCmd.isEmpty()) return
             isBusy = true
             scope.launch {
                 val outcome = runSandboxCommand(directCmd)
@@ -311,7 +330,7 @@ fun OpenBotApp(rootfsManager: RootfsManager, settingsStore: AgentSettingsStore) 
     fun resolveApproval(message: ChatMessage, approved: Boolean) {
         val approval = message.pendingApproval ?: return
         val idx = messages.indexOfFirst { it.id == message.id }
-        if (idx == -1) return
+        if (idx == -1 || !resolvingApprovals.add(approval.id)) return
 
         messages[idx] = message.copy(
             text = if (approved) "Approving `${approval.command}`..." else "Rejecting `${approval.command}`...",
@@ -341,34 +360,28 @@ fun OpenBotApp(rootfsManager: RootfsManager, settingsStore: AgentSettingsStore) 
             }
 
             if (agentMode && llmConfig.isConfigured()) {
-                // Feed approval resolution back to agent context and continue the bounded loop.
-                agentHistory.add(LlmChatMessage("user", "Approval resolution for `${approval.command}`:\n$statusLine\n\nExplain the result. If another command is needed, provide exactly one bash block."))
+                // Feed the resolution back to the same bounded loop used by chat turns.
+                // The old follow-up code only inspected one reply and silently
+                // discarded a command proposed in the next one.
+                agentHistory.add(
+                    LlmChatMessage(
+                        "user",
+                        "Approval resolution for `${approval.command}`:\n$statusLine\n\n" +
+                            "Explain the result. If another command is needed, provide exactly one bash block."
+                    )
+                )
                 isBusy = true
                 try {
-                    val followUp = withContext(Dispatchers.IO) { LlmClient(llmConfig).chat(agentHistory.toList()) }
-                    agentHistory.add(LlmChatMessage("assistant", followUp))
-                    val parsed = parseAgentReply(followUp)
-                    messages.add(ChatMessage("ai-appr-${System.currentTimeMillis()}", "OpenBot", parsed.text, false))
-                    val nextCmd = parsed.command
-                    if (nextCmd != null) {
-                        messages.add(ChatMessage("sys-appr-${System.currentTimeMillis()}", "OpenBot", "Proposed command detected. Executing in sandbox:\n`$nextCmd`", false))
-                        val nextOutcome = runSandboxCommand(nextCmd)
-                        val nextOutcomeText = appendOutcome(nextCmd, nextOutcome)
-                        val feedback = when (nextOutcome) {
-                            is ActionOutcomeData.Executed -> "Command executed.\n$nextCmd\n\nResult:\n$nextOutcomeText"
-                            is ActionOutcomeData.NeedsApproval -> "Command requires approval in UI.\n$nextCmd\n\nReason: ${nextOutcome.approval.reason}"
-                            is ActionOutcomeData.Denied -> "Command denied by policy.\n$nextCmd\n\nReason: ${nextOutcome.reason}"
-                            is ActionOutcomeData.Error -> "Command execution error.\n$nextCmd\n\nError: ${nextOutcome.message}"
-                        }
-                        agentHistory.add(LlmChatMessage("user", "Tool result:\n$feedback\n\nExplain the result to the user. If another command is needed, provide exactly one bash block."))
-                        if (nextOutcome !is ActionOutcomeData.NeedsApproval) {
-                            val followUp2 = withContext(Dispatchers.IO) { LlmClient(llmConfig).chat(agentHistory.toList()) }
-                            agentHistory.add(LlmChatMessage("assistant", followUp2))
-                            messages.add(ChatMessage("ai-appr2-${System.currentTimeMillis()}", "OpenBot", parseAgentReply(followUp2).text, false))
-                        }
-                    }
+                    runAgentLoop("ai-appr")
                 } catch (e: Exception) {
-                    messages.add(ChatMessage("ai-appr-err-${System.currentTimeMillis()}", "OpenBot", "⚠️ Agent error: ${e.message}", false))
+                    messages.add(
+                        ChatMessage(
+                            "ai-appr-err-${System.currentTimeMillis()}",
+                            "OpenBot",
+                            "⚠️ Agent error: ${e.message}",
+                            false
+                        )
+                    )
                 } finally {
                     isBusy = false
                 }

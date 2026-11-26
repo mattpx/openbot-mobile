@@ -1,6 +1,7 @@
 package com.openbot.mobile
 
 import android.content.Context
+import java.net.URI
 
 data class LlmConfig(
     val baseUrl: String = DEFAULT_BASE_URL,
@@ -26,11 +27,14 @@ data class LlmConfig(
                 "Never invent command output. High-risk commands require human approval in the app."
 
         fun isHttpUrl(value: String): Boolean {
-            val trimmed = value.trim()
-            if (!trimmed.startsWith("https://") && !trimmed.startsWith("http://")) {
-                return false
+            return try {
+                val uri = URI(value.trim())
+                (uri.scheme?.equals("http", ignoreCase = true) == true ||
+                    uri.scheme?.equals("https", ignoreCase = true) == true) &&
+                    !uri.host.isNullOrBlank()
+            } catch (_: Exception) {
+                false
             }
-            return trimmed.length > "https://".length
         }
     }
 }
@@ -69,8 +73,10 @@ class AgentSettingsStore(context: Context) {
     /** Moves a key written by older app versions into Keystore storage. */
     private fun migrateLegacyPlaintextKey() {
         val legacy = prefs.getString("apiKey", null) ?: return
-        if (legacy.isNotBlank()) {
-            vault.save(legacy.trim())
+        if (legacy.isNotBlank() && !vault.save(legacy.trim())) {
+            // Keep the plaintext key so the user does not lose it when Keystore
+            // is unavailable; a failed encryption must not look like a migration.
+            return
         }
         prefs.edit().remove("apiKey").apply()
     }
