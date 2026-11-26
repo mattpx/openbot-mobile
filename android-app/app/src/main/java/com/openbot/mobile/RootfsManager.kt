@@ -7,16 +7,30 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.FileOutputStream
 
 sealed class SandboxStatus {
     object Uninitialized : SandboxStatus()
     data class SettingUp(val message: String, val progress: Float) : SandboxStatus()
-    data class Ready(val prootPath: String, val rootfsPath: String, val workspacePath: String) : SandboxStatus()
+
+    data class Ready(
+        val prootPath: String,
+        val rootfsPath: String,
+        val workspacePath: String,
+        /** `proot` for real isolation, `shim` for degraded fallback, `mock` for debug builds. */
+        val mode: String,
+        val prootVersion: String,
+        val rootfsVersion: String,
+        /** `bundled` when a real rootfs archive was extracted, `minimal` otherwise. */
+        val rootfsKind: String,
+        val warning: String?
+    ) : SandboxStatus()
+
     data class Failed(val error: String) : SandboxStatus()
 }
 
 class RootfsManager(private val context: Context) {
+
+    private val assets = SandboxAssets(context)
 
     private val _status = MutableStateFlow<SandboxStatus>(SandboxStatus.Uninitialized)
     val status: StateFlow<SandboxStatus> = _status
@@ -28,94 +42,129 @@ class RootfsManager(private val context: Context) {
 
     suspend fun initializeSandbox(): Boolean = withContext(Dispatchers.IO) {
         try {
-            _status.value = SandboxStatus.SettingUp("Checking PRoot environment...", 0.1f)
+            val abi = abi()
+            val warnings = mutableListOf<String>()
+            val manifest = assets.loadManifest()
 
-            if (!prootBin.exists() || prootBin.length() == 0L) {
-                _status.value = SandboxStatus.SettingUp("Installing PRoot engine...", 0.3f)
-                installProotBinary()
+            _status.value = SandboxStatus.SettingUp("Checking sandbox assets for $abi...", 0.05f)
+
+            if (manifest.proot.isEmpty()) {
+                warnings += "No PRoot binary is bundled with this build."
             }
-            prootBin.setExecutable(true, false)
-            prootBin.setReadable(true, false)
 
-            _status.value = SandboxStatus.SettingUp("Configuring rootfs filesystem...", 0.6f)
-            ensureMinimalRootfsStructure()
+            _status.value = SandboxStatus.SettingUp("Installing PRoot binary...", 0.2f)
+            var installedProot = false
+            var prootVersion = "unbundled-shim"
+            when (val proot = assets.installProot(abi, prootBin)) {
+                is ProotInstallResult.Installed -> {
+                    installedProot = true
+                    prootVersion = proot.entry?.version?.ifBlank { "unversioned" } ?: "unverified"
+                    if (!proot.verified) {
+                        warnings += "PRoot binary was installed without a verified checksum."
+                    }
+                }
+                is ProotInstallResult.Failed -> {
+                    warnings += "PRoot install failed: ${proot.reason}"
+                    installShim()
+                }
+                ProotInstallResult.Missing -> installShim()
+            }
+            if (!installedProot) {
+                warnings += "Running in degraded shim mode: commands are not filesystem-isolated."
+            }
 
-            _status.value = SandboxStatus.SettingUp("Starting OpenBot core engine...", 0.9f)
+            _status.value = SandboxStatus.SettingUp("Provisioning Linux rootfs...", 0.55f)
+            var rootfsKind = "minimal"
+            var rootfsVersion = "minimal"
+            when (val rootfs = assets.installRootfs(abi, rootfsDir)) {
+                is RootfsInstallResult.Installed -> {
+                    rootfsKind = "bundled"
+                    rootfsVersion = rootfs.version
+                    if (!rootfs.verified) {
+                        warnings += "Rootfs was installed without a verified checksum."
+                    }
+                }
+                is RootfsInstallResult.Failed -> {
+                    warnings += "Bundled rootfs rejected: ${rootfs.reason}"
+                }
+                RootfsInstallResult.Missing -> Unit
+            }
+
+            // Always ensure the minimal layout exists: it supplies bind-mount
+            // targets and lets real PRoot run with /system bound into the guest.
+            ensureMinimalRootfsStructure(rootfsKind, rootfsVersion)
+
+            _status.value = SandboxStatus.SettingUp("Starting OpenBot core engine...", 0.85f)
             val initialized = OpenBotCore.initEngine(
                 prootPath = prootBin.absolutePath,
                 rootfsPath = rootfsDir.absolutePath,
                 workspacePath = workspaceDir.absolutePath
             )
-
-            if (initialized) {
-                _status.value = SandboxStatus.Ready(
-                    prootPath = prootBin.absolutePath,
-                    rootfsPath = rootfsDir.absolutePath,
-                    workspacePath = workspaceDir.absolutePath
-                )
-                true
-            } else {
-                _status.value = SandboxStatus.Failed("Failed to initialize Rust Core OpenBotEngine")
-                false
+            if (!initialized) {
+                _status.value = SandboxStatus.Failed("Failed to initialize the Rust core engine")
+                return@withContext false
             }
+
+            val engineMode = OpenBotCore.sandboxMode()
+            if (engineMode == "proot" && !installedProot) {
+                warnings += "Engine reported PRoot mode without an installed PRoot binary."
+            }
+            if (engineMode == "shim" || engineMode == "mock") {
+                warnings += "This build is not sandboxed: filesystem isolation is unavailable."
+            }
+
+            _status.value = SandboxStatus.Ready(
+                prootPath = prootBin.absolutePath,
+                rootfsPath = rootfsDir.absolutePath,
+                workspacePath = workspaceDir.absolutePath,
+                mode = engineMode.ifBlank { if (installedProot) "proot" else "shim" },
+                prootVersion = prootVersion,
+                rootfsVersion = rootfsVersion,
+                rootfsKind = rootfsKind,
+                warning = warnings.distinct().joinToString(" ").ifBlank { null }
+            )
+            true
         } catch (e: Exception) {
-            _status.value = SandboxStatus.Failed("Setup error: ${e.message}")
+            _status.value = SandboxStatus.Failed("Setup error: ${e.message ?: e.toString()}")
             false
         }
     }
 
-    private fun installProotBinary() {
-        val assetName = preferredProotAsset()
-        val candidates = listOfNotNull(assetName, "proot", "proot-${abi()}")
-        for (name in candidates) {
-            try {
-                context.assets.open(name).use { input ->
-                    FileOutputStream(prootBin).use { output -> input.copyTo(output) }
-                }
-                prootBin.setExecutable(true, false)
-                if (prootBin.length() > 0L) return
-            } catch (_: Exception) {
-                // try next candidate
-            }
-        }
-
-        // Fallback shim. Rust proot.rs detects OPENBOT_SHIM and executes via system sh.
+    private fun installShim() {
+        prootBin.delete()
         prootBin.writeText(
             """
             #!/system/bin/sh
             # OPENBOT_SHIM
-            # Real proot binary not bundled; Rust engine will fall back to direct shell execution.
+            # Degraded fallback: the Rust executor runs commands directly with sh.
             exec "$@"
             """.trimIndent() + "\n"
         )
         prootBin.setExecutable(true, false)
-    }
-
-    private fun preferredProotAsset(): String? {
-        return when (abi()) {
-            "arm64-v8a" -> "proot-arm64"
-            "x86_64" -> "proot-x86_64"
-            "armeabi-v7a" -> "proot-arm"
-            else -> null
-        }
+        prootBin.setReadable(true, false)
     }
 
     private fun abi(): String = Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"
 
-    private fun ensureMinimalRootfsStructure() {
-        val dirs = listOf("bin", "etc", "dev", "proc", "sys", "tmp", "usr/bin", "workspace", "home")
+    private fun ensureMinimalRootfsStructure(rootfsKind: String, rootfsVersion: String) {
+        val dirs = listOf(
+            "bin", "etc", "dev", "proc", "sys", "tmp", "usr/bin",
+            "workspace", "home", "root", "var/tmp"
+        )
         for (dir in dirs) File(rootfsDir, dir).mkdirs()
 
-        // Minimal /etc files for tools that expect them
         val passwd = File(rootfsDir, "etc/passwd")
-        if (!passwd.exists()) passwd.writeText("root:x:0:0:root:/workspace:/bin/sh\n")
+        if (!passwd.exists()) passwd.writeText("root:x:0:0:root:/root:/bin/sh\n")
+        val group = File(rootfsDir, "etc/group")
+        if (!group.exists()) group.writeText("root:x:0:\n")
         val hosts = File(rootfsDir, "etc/hosts")
-        if (!hosts.exists()) hosts.writeText("127.0.0.1 localhost\n")
+        if (!hosts.exists()) hosts.writeText("127.0.0.1 localhost\n::1 localhost\n")
 
-        // Marker for diagnostics
-        File(rootfsDir, "etc/openbot-rootfs").writeText("openbot-mobile-minimal-rootfs\n")
+        val marker = File(rootfsDir, "etc/openbot-rootfs")
+        marker.writeText("openbot-rootfs:$rootfsKind:$rootfsVersion\n")
 
-        // Symlink-ish sh helper is not reliable on Android; just place a script.
+        // A rootfs shell helper for PRoot. /system is bind-mounted so this
+        // resolves both inside real PRoot and in the degraded shim.
         val shFile = File(rootfsDir, "bin/sh")
         if (!shFile.exists()) {
             shFile.writeText("#!/system/bin/sh\nexec /system/bin/sh \"$@\"\n")

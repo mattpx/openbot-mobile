@@ -2,6 +2,7 @@ use crate::policy::{PolicyDecision, PolicyEngine};
 use crate::proot::{ExecutionResult, PRootConfig, PRootExecutor, SandboxError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
@@ -38,12 +39,30 @@ pub struct OpenBotEngine {
 
 impl OpenBotEngine {
     pub fn new(proot_bin: &str, rootfs_dir: &str, workspace_dir: &str) -> Self {
-        let config = PRootConfig::new(proot_bin, rootfs_dir, workspace_dir);
+        let config = Self::config_for(proot_bin, rootfs_dir, workspace_dir);
         Self {
             executor: PRootExecutor::new(config),
             policy: PolicyEngine::new_standard(),
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Builds the sandbox config, choosing a shell that actually exists.
+    ///
+    /// A bundled rootfs supplies `/bin/sh`; the Android minimal rootfs instead
+    /// relies on `/system/bin/sh` through the `/system` bind mount.
+    fn config_for(proot_bin: &str, rootfs_dir: &str, workspace_dir: &str) -> PRootConfig {
+        let mut config = PRootConfig::new(proot_bin, rootfs_dir, workspace_dir);
+        let rootfs_shell = config.rootfs_path.join("bin/sh");
+        if !rootfs_shell.exists() && Path::new("/system/bin/sh").exists() {
+            config = config.with_shell_path("/system/bin/sh");
+        }
+        config
+    }
+
+    /// `"proot"` for real isolation, `"shim"` for the degraded fallback.
+    pub fn sandbox_mode(&self) -> &'static str {
+        self.executor.sandbox_mode()
     }
 
     /// Evaluates policy and conditionally executes a shell command or pauses for approval.
@@ -187,5 +206,48 @@ mod tests {
         let result = engine.resolve_approval(&pending_id, false);
         assert!(matches!(result, Err(EngineError::ActionDenied(_))));
         assert_eq!(engine.list_pending_approvals().len(), 0);
+    }
+
+    #[test]
+    fn test_engine_is_shareable_across_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<OpenBotEngine>();
+    }
+
+    #[test]
+    fn test_pending_approvals_readable_during_execution() {
+        let temp = tempdir().unwrap();
+        let (temp_keep, engine) = {
+            let proot = temp.path().join("proot");
+            std::fs::write(&proot, b"#!/bin/sh\n# OPENBOT_SHIM\nexit 0\n").unwrap();
+            let rootfs = temp.path().join("rootfs");
+            std::fs::create_dir_all(rootfs.join("tmp")).unwrap();
+            let ws = temp.path().join("workspace");
+            std::fs::create_dir(&ws).unwrap();
+            let engine = OpenBotEngine::new(
+                proot.to_str().unwrap(),
+                rootfs.to_str().unwrap(),
+                ws.to_str().unwrap(),
+            );
+            (temp, engine)
+        };
+        let engine = Arc::new(engine);
+        let worker = {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || engine.request_execute("sleep 2"))
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let started = std::time::Instant::now();
+        let pending = engine.list_pending_approvals();
+        assert!(pending.is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "listing approvals blocked on a running command"
+        );
+
+        let outcome = worker.join().unwrap().unwrap();
+        assert!(matches!(outcome, ActionOutcome::Executed(_)));
+        drop(temp_keep);
     }
 }
