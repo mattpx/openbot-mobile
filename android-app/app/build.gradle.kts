@@ -42,6 +42,9 @@ android {
         compose = true
         buildConfig = true
     }
+    androidResources {
+        noCompress += listOf("tgz")
+    }
     sourceSets {
         getByName("main") {
             jniLibs.srcDirs("src/main/jniLibs")

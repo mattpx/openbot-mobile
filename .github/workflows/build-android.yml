@@ -80,8 +80,8 @@ jobs:
               "assets/sandbox/manifest.json",
               "assets/sandbox/proot-arm64",
               "assets/sandbox/proot-x86_64",
-              "assets/sandbox/rootfs-arm64.tar.gz",
-              "assets/sandbox/rootfs-x86_64.tar.gz",
+              "assets/sandbox/rootfs-arm64.tgz",
+              "assets/sandbox/rootfs-x86_64.tgz",
           ]
           missing = [r for r in required if r not in names]
           assert not missing, f"APK {apk} missing required entries: {missing}"

@@ -25,14 +25,14 @@
   },
   "rootfs": {
     "arm64-v8a": {
-      "asset": "sandbox/rootfs-arm64.tar.gz",
+      "asset": "sandbox/rootfs-arm64.tgz",
       "sha256": "fc957a820e80660eec7c1dde2b619385f153f1c04d0eb537449eb6b6c24ba107",
       "version": "alpine-3.21.10",
       "source": "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.10-aarch64.tar.gz",
       "license": "MIT/GPL-2.0-only"
     },
     "x86_64": {
-      "asset": "sandbox/rootfs-x86_64.tar.gz",
+      "asset": "sandbox/rootfs-x86_64.tgz",
       "sha256": "d225c786541b5ae5ba006ef541701d9ecc7e732bd16317c08adfb93212345efa",
       "version": "alpine-3.21.10",
       "source": "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.10-x86_64.tar.gz",

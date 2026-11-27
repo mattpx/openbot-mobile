@@ -42,8 +42,8 @@ This directory also bundles official Alpine Linux minirootfs archives for 64-bit
 
 | Asset | ABI Target | Upstream File | Size | SHA256 Checksum |
 |---|---|---|---|---|
-| `rootfs-arm64.tar.gz` | `arm64-v8a` | `alpine-minirootfs-3.21.10-aarch64.tar.gz` | 3,831,092 bytes | `fc957a820e80660eec7c1dde2b619385f153f1c04d0eb537449eb6b6c24ba107` |
-| `rootfs-x86_64.tar.gz` | `x86_64` | `alpine-minirootfs-3.21.10-x86_64.tar.gz` | 3,490,079 bytes | `d225c786541b5ae5ba006ef541701d9ecc7e732bd16317c08adfb93212345efa` |
+| `rootfs-arm64.tgz` | `arm64-v8a` | `alpine-minirootfs-3.21.10-aarch64.tar.gz` | 3,831,092 bytes | `fc957a820e80660eec7c1dde2b619385f153f1c04d0eb537449eb6b6c24ba107` |
+| `rootfs-x86_64.tgz` | `x86_64` | `alpine-minirootfs-3.21.10-x86_64.tar.gz` | 3,490,079 bytes | `d225c786541b5ae5ba006ef541701d9ecc7e732bd16317c08adfb93212345efa` |
 
 Checksums match the official upstream `.sha256` digests and are verified at install time by `com.openbot.mobile.SandboxAssets` before extraction.
 
