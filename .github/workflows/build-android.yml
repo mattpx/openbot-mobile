@@ -39,6 +39,22 @@ jobs:
           cargo test
           cargo ndk -t arm64-v8a -t x86_64 -o ../android-app/app/src/main/jniLibs build --release
 
+      - name: Verify Sandbox Assets & Manifest Checksums
+        run: |
+          python3 - <<'EOF'
+          import hashlib, json, pathlib
+          root = pathlib.Path("android-app/app/src/main/assets")
+          manifest = json.loads((root / "sandbox/manifest.json").read_text())
+          for section in ("proot", "rootfs"):
+              assert manifest.get(section), f"Missing {section} entries in manifest.json"
+              for abi, entry in manifest[section].items():
+                  path = root / entry["asset"]
+                  assert path.is_file(), f"Missing asset {path}"
+                  actual = hashlib.sha256(path.read_bytes()).hexdigest()
+                  assert actual == entry["sha256"], f"Checksum mismatch for {path}: {actual} != {entry['sha256']}"
+                  print(f"Verified {section}/{abi}: {entry['asset']} ({path.stat().st_size} bytes)")
+          EOF
+
       - name: Grant execute permission for gradlew
         run: |
           cd android-app
@@ -49,9 +65,35 @@ jobs:
           cd android-app
           ./gradlew assembleDebug --stacktrace
 
+      - name: APK Asset & Native Library Smoke Check
+        run: |
+          python3 - <<'EOF'
+          import zipfile, glob
+          apks = glob.glob("android-app/app/build/outputs/apk/debug/*.apk")
+          assert apks, "No debug APK found"
+          apk = apks[0]
+          with zipfile.ZipFile(apk) as zf:
+              names = set(zf.namelist())
+          required = [
+              "lib/arm64-v8a/libopenbot_core.so",
+              "lib/x86_64/libopenbot_core.so",
+              "assets/sandbox/manifest.json",
+              "assets/sandbox/proot-arm64",
+              "assets/sandbox/proot-x86_64",
+              "assets/sandbox/rootfs-arm64.tar.gz",
+              "assets/sandbox/rootfs-x86_64.tar.gz",
+          ]
+          missing = [r for r in required if r not in names]
+          assert not missing, f"APK {apk} missing required entries: {missing}"
+          print(f"APK smoke check passed ({apk}): {len(required)} required entries verified.")
+          EOF
+
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
           name: openbot-mobile-debug-apk
-          path: android-app/app/build/outputs/apk/debug/*.apk
+          path: |
+            android-app/app/build/outputs/apk/debug/*.apk
+            android-app/app/src/main/assets/sandbox/manifest.json
+            android-app/app/src/main/assets/sandbox/PROVENANCE.md
           if-no-files-found: error
