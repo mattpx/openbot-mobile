@@ -156,6 +156,28 @@ pub extern "system" fn Java_com_openbot_mobile_OpenBotCore_nativeSandboxMode(
     to_jstring(&mut env, &mode)
 }
 
+#[no_mangle]
+pub extern "system" fn Java_com_openbot_mobile_OpenBotCore_nativeSetCustomPolicyRules(
+    mut env: JNIEnv,
+    _class: JClass,
+    rules_json: JString,
+) -> jboolean {
+    let raw: String = match env.get_string(&rules_json) {
+        Ok(s) => s.into(),
+        Err(_) => return 0,
+    };
+    let rules: Vec<crate::policy::PolicyRule> = match serde_json::from_str(&raw) {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    let engine = match clone_engine_handle(engine_slot()) {
+        Some(engine) => engine,
+        None => return 0,
+    };
+    engine.set_custom_policy_rules(rules);
+    1
+}
+
 fn create_error_json(env: &mut JNIEnv, err_msg: &str) -> jstring {
     let escaped = serde_json::to_string(err_msg).unwrap_or_else(|_| "\"error\"".to_string());
     let json = format!("{{\"error\":{}}}", escaped);

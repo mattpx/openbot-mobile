@@ -7,6 +7,13 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.IOException
+import java.nio.file.FileVisitResult
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.Path
+import java.nio.file.SimpleFileVisitor
+import java.nio.file.attribute.BasicFileAttributes
 
 sealed class SandboxStatus {
     object Uninitialized : SandboxStatus()
@@ -39,6 +46,47 @@ class RootfsManager(private val context: Context) {
     private val rootfsDir: File by lazy { File(context.filesDir, "rootfs").apply { mkdirs() } }
     private val workspaceDir: File by lazy { File(context.filesDir, "workspace").apply { mkdirs() } }
     private val prootBin: File by lazy { File(binDir, "proot") }
+
+    val workspaceDirectory: File
+        get() = workspaceDir
+
+    suspend fun resetWorkspace(): Boolean = withContext(Dispatchers.IO) {
+        try {
+            deleteTree(workspaceDir)
+            workspaceDir.mkdirs()
+            workspaceDir.isDirectory
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    suspend fun reinstallRootfs(): Boolean = withContext(Dispatchers.IO) {
+        try {
+            _status.value = SandboxStatus.SettingUp("Removing existing rootfs...", 0.05f)
+            deleteTree(rootfsDir)
+            rootfsDir.mkdirs()
+            initializeSandbox()
+        } catch (e: Exception) {
+            _status.value = SandboxStatus.Failed("Rootfs reinstall error: ${e.message ?: e.toString()}")
+            false
+        }
+    }
+
+    private fun deleteTree(dir: File) {
+        val root = dir.toPath()
+        if (!Files.exists(root, LinkOption.NOFOLLOW_LINKS)) return
+        Files.walkFileTree(root, object : SimpleFileVisitor<Path>() {
+            override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                Files.deleteIfExists(file)
+                return FileVisitResult.CONTINUE
+            }
+
+            override fun postVisitDirectory(d: Path, exc: IOException?): FileVisitResult {
+                Files.deleteIfExists(d)
+                return FileVisitResult.CONTINUE
+            }
+        })
+    }
 
     suspend fun initializeSandbox(): Boolean = withContext(Dispatchers.IO) {
         try {
@@ -159,14 +207,20 @@ class RootfsManager(private val context: Context) {
         if (!group.exists()) group.writeText("root:x:0:\n")
         val hosts = File(rootfsDir, "etc/hosts")
         if (!hosts.exists()) hosts.writeText("127.0.0.1 localhost\n::1 localhost\n")
+        val resolv = File(rootfsDir, "etc/resolv.conf")
+        if (!resolv.exists() || resolv.length() == 0L) {
+            resolv.writeText("nameserver 1.1.1.1\nnameserver 8.8.8.8\n")
+        }
 
-        val marker = File(rootfsDir, "etc/openbot-rootfs")
-        marker.writeText("openbot-rootfs:$rootfsKind:$rootfsVersion\n")
+        if (rootfsKind != "bundled") {
+            val marker = File(rootfsDir, "etc/openbot-rootfs")
+            marker.writeText("openbot-rootfs:$rootfsKind:$rootfsVersion\n")
+        }
 
-        // A rootfs shell helper for PRoot. /system is bind-mounted so this
-        // resolves both inside real PRoot and in the degraded shim.
+        // A rootfs shell helper for PRoot when no bundled Linux rootfs is present.
+        // Use NOFOLLOW_LINKS so we don't clobber Alpine's /bin/sh -> /bin/busybox symlink.
         val shFile = File(rootfsDir, "bin/sh")
-        if (!shFile.exists()) {
+        if (!Files.exists(shFile.toPath(), LinkOption.NOFOLLOW_LINKS)) {
             shFile.writeText("#!/system/bin/sh\nexec /system/bin/sh \"$@\"\n")
             shFile.setExecutable(true, false)
         }

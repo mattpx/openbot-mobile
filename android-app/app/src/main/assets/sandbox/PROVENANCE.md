@@ -25,3 +25,31 @@ All checksums are verified at install time by `com.openbot.mobile.SandboxAssets`
 - **License**: GNU General Public License v2.0 or later ([GPL-2.0-or-later](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html)).
 - **Copyright**: (C) 2014-2023 PRoot contributors.
 - **Embedded Libraries**: `talloc` is licensed under the GNU Lesser General Public License (LGPLv3+).
+
+---
+
+# Bundled Linux Rootfs Provenance & Attribution
+
+This directory also bundles official Alpine Linux minirootfs archives for 64-bit Android targets (`arm64-v8a`, `x86_64`), providing musl libc, BusyBox (`/bin/sh` + coreutils), `apk-tools`, and Mozilla CA certificates (`/etc/ssl/certs/ca-certificates.crt`).
+
+## 1. Upstream Source
+
+- **Distribution**: [Alpine Linux](https://alpinelinux.org/) minirootfs
+- **Release Version**: `3.21.10`
+- **Upstream Mirror**: `https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/`
+
+## 2. Rootfs Verification & Checksums
+
+| Asset | ABI Target | Upstream File | Size | SHA256 Checksum |
+|---|---|---|---|---|
+| `rootfs-arm64.tar.gz` | `arm64-v8a` | `alpine-minirootfs-3.21.10-aarch64.tar.gz` | 3,831,092 bytes | `fc957a820e80660eec7c1dde2b619385f153f1c04d0eb537449eb6b6c24ba107` |
+| `rootfs-x86_64.tar.gz` | `x86_64` | `alpine-minirootfs-3.21.10-x86_64.tar.gz` | 3,490,079 bytes | `d225c786541b5ae5ba006ef541701d9ecc7e732bd16317c08adfb93212345efa` |
+
+Checksums match the official upstream `.sha256` digests and are verified at install time by `com.openbot.mobile.SandboxAssets` before extraction.
+
+## 3. License & Attribution
+
+- **Alpine Linux / musl**: MIT License.
+- **BusyBox**: GNU General Public License v2.0 ([GPL-2.0-only](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html)).
+- **OpenSSL / libcrypto / libssl**: Apache License 2.0.
+- **CA Certificates**: MPL-2.0.

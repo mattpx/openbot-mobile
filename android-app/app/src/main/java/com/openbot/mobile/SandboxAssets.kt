@@ -6,6 +6,7 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.FileVisitResult
 import java.nio.file.SimpleFileVisitor
@@ -138,7 +139,23 @@ class SandboxAssets(private val context: Context) {
 
     fun installRootfs(abi: String, rootfsDir: File): RootfsInstallResult {
         val entry = loadManifest().rootfs[abi] ?: return RootfsInstallResult.Missing
+        val version = entry.version.ifBlank { "unversioned" }
+        val expectedMarker = rootfsMarkerValue("bundled", version, entry.sha256)
+        val existingMarker = File(rootfsDir, "etc/openbot-rootfs")
+        if (existingMarker.isFile &&
+            runCatching { existingMarker.readText().trim() }.getOrNull() == expectedMarker &&
+            hasRootfsShell(rootfsDir)
+        ) {
+            return RootfsInstallResult.Installed(
+                version = version,
+                verified = entry.sha256.isNotBlank()
+            )
+        }
+
         val archive = File(context.cacheDir, "openbot-rootfs-${shortAbi(abi)}.tar.gz")
+        val parentDir = rootfsDir.parentFile ?: context.filesDir
+        val stagingDir = File(parentDir, "${rootfsDir.name}.staging")
+        val backupDir = File(parentDir, "${rootfsDir.name}.old")
         if (!copyAsset(entry.asset, archive)) {
             return RootfsInstallResult.Failed("Declared rootfs asset ${entry.asset} is missing")
         }
@@ -148,20 +165,65 @@ class SandboxAssets(private val context: Context) {
             if (entry.sha256.isNotBlank() && !verified) {
                 return RootfsInstallResult.Failed("Rootfs checksum mismatch for ${entry.asset}")
             }
-            val error = extractArchive(archive, rootfsDir)
+            deleteTree(stagingDir)
+            val error = extractArchive(archive, stagingDir)
             if (error != null) {
                 return RootfsInstallResult.Failed(error)
             }
-            val marker = File(rootfsDir, "etc/openbot-rootfs")
-            if (!marker.isFile) {
-                return RootfsInstallResult.Failed("Rootfs archive did not contain etc/openbot-rootfs")
+            if (!hasRootfsShell(stagingDir)) {
+                return RootfsInstallResult.Failed("Rootfs archive did not contain a valid bin/sh")
             }
+            val etcDir = File(stagingDir, "etc").apply { mkdirs() }
+            File(etcDir, "openbot-rootfs").writeText("$expectedMarker\n")
+
+            deleteTree(backupDir)
+            if (rootfsDir.exists() && !rootfsDir.renameTo(backupDir)) {
+                deleteTree(rootfsDir)
+            }
+            if (!stagingDir.renameTo(rootfsDir)) {
+                if (backupDir.exists()) backupDir.renameTo(rootfsDir)
+                return RootfsInstallResult.Failed("Failed to activate extracted rootfs")
+            }
+            deleteTree(backupDir)
             return RootfsInstallResult.Installed(
-                version = entry.version.ifBlank { "unversioned" },
+                version = version,
                 verified = verified
             )
         } finally {
             archive.delete()
+            deleteTree(stagingDir)
+        }
+    }
+
+    fun hasRootfsShell(rootfsDir: File): Boolean {
+        val shPath = File(rootfsDir, "bin/sh").toPath()
+        if (!Files.exists(shPath, LinkOption.NOFOLLOW_LINKS)) return false
+        if (!Files.isSymbolicLink(shPath)) return true
+        val target = runCatching { Files.readSymbolicLink(shPath).toString() }.getOrNull() ?: return false
+        val rootPath = rootfsDir.toPath().normalize()
+        val resolved = if (target.startsWith("/")) {
+            rootPath.resolve(target.removePrefix("/"))
+        } else {
+            (shPath.parent ?: rootPath).resolve(target)
+        }.normalize()
+        return resolved.startsWith(rootPath) && Files.exists(resolved, LinkOption.NOFOLLOW_LINKS)
+    }
+
+    private fun deleteTree(dir: File) {
+        val root = dir.toPath()
+        if (!Files.exists(root, LinkOption.NOFOLLOW_LINKS)) return
+        runCatching {
+            Files.walkFileTree(root, object : SimpleFileVisitor<Path>() {
+                override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                    Files.deleteIfExists(file)
+                    return FileVisitResult.CONTINUE
+                }
+
+                override fun postVisitDirectory(d: Path, exc: java.io.IOException?): FileVisitResult {
+                    Files.deleteIfExists(d)
+                    return FileVisitResult.CONTINUE
+                }
+            })
         }
     }
 
@@ -330,9 +392,12 @@ class SandboxAssets(private val context: Context) {
         else -> abi
     }
 
-    private companion object {
+    companion object {
         const val TAG = "SandboxAssets"
         const val LISTING_MAX_CHARS = 1_000_000
+
+        fun rootfsMarkerValue(kind: String, version: String, sha256: String): String =
+            "openbot-rootfs:$kind:$version:$sha256"
         val LINK_TARGET_REGEX = Regex("^(.*?)(?: -> | link to )(.+)$")
         val ELF_MAGIC = byteArrayOf(
             0x7f.toByte(),

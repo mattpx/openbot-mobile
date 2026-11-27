@@ -212,7 +212,26 @@ impl PRootExecutor {
         } else {
             let args = self.build_args(command_str);
             let mut cmd = Command::new(&self.config.proot_path);
-            cmd.args(&args);
+            cmd.args(&args)
+                .env(
+                    "PROOT_TMP_DIR",
+                    self.config
+                        .rootfs_path
+                        .join("tmp")
+                        .to_string_lossy()
+                        .as_ref(),
+                )
+                // Android kernels enforce strict seccomp filters that can break
+                // PRoot's ptrace+seccomp acceleration on non-rooted devices.
+                .env("PROOT_NO_SECCOMP", "1")
+                .env("HOME", "/root")
+                .env("TMPDIR", "/tmp")
+                .env(
+                    "PATH",
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/system/bin",
+                )
+                .env_remove("LD_PRELOAD")
+                .env_remove("LD_LIBRARY_PATH");
             cmd
         };
         command.stdout(Stdio::piped()).stderr(Stdio::piped());

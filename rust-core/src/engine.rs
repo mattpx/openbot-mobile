@@ -1,4 +1,4 @@
-use crate::policy::{PolicyDecision, PolicyEngine};
+use crate::policy::{PolicyDecision, PolicyEngine, PolicyRule};
 use crate::proot::{ExecutionResult, PRootConfig, PRootExecutor, SandboxError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -33,7 +33,7 @@ pub enum ActionOutcome {
 
 pub struct OpenBotEngine {
     executor: PRootExecutor,
-    policy: PolicyEngine,
+    policy: Mutex<PolicyEngine>,
     pending_approvals: Arc<Mutex<HashMap<String, PendingApproval>>>,
 }
 
@@ -42,8 +42,22 @@ impl OpenBotEngine {
         let config = Self::config_for(proot_bin, rootfs_dir, workspace_dir);
         Self {
             executor: PRootExecutor::new(config),
-            policy: PolicyEngine::new_standard(),
+            policy: Mutex::new(PolicyEngine::new_standard()),
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Replaces user-defined policy rules while preserving the standard baseline rules.
+    pub fn set_custom_policy_rules(&self, custom_rules: Vec<PolicyRule>) {
+        let mut engine = PolicyEngine::new_standard();
+        for rule in custom_rules {
+            if !rule.pattern.trim().is_empty() {
+                engine.add_rule(rule);
+            }
+        }
+        match self.policy.lock() {
+            Ok(mut guard) => *guard = engine,
+            Err(poisoned) => *poisoned.into_inner() = engine,
         }
     }
 
@@ -54,7 +68,9 @@ impl OpenBotEngine {
     fn config_for(proot_bin: &str, rootfs_dir: &str, workspace_dir: &str) -> PRootConfig {
         let mut config = PRootConfig::new(proot_bin, rootfs_dir, workspace_dir);
         let rootfs_shell = config.rootfs_path.join("bin/sh");
-        if !rootfs_shell.exists() && Path::new("/system/bin/sh").exists() {
+        // Use symlink_metadata so an in-rootfs absolute symlink (e.g. Alpine's
+        // /bin/sh -> /bin/busybox) is recognized even when /bin/busybox is absent on host.
+        if rootfs_shell.symlink_metadata().is_err() && Path::new("/system/bin/sh").exists() {
             config = config.with_shell_path("/system/bin/sh");
         }
         config
@@ -67,7 +83,10 @@ impl OpenBotEngine {
 
     /// Evaluates policy and conditionally executes a shell command or pauses for approval.
     pub fn request_execute(&self, command: &str) -> Result<ActionOutcome, EngineError> {
-        let decision = self.policy.evaluate_shell_command(command);
+        let decision = match self.policy.lock() {
+            Ok(guard) => guard.evaluate_shell_command(command),
+            Err(poisoned) => poisoned.into_inner().evaluate_shell_command(command),
+        };
 
         match decision {
             PolicyDecision::Allow => {
@@ -212,6 +231,32 @@ mod tests {
     fn test_engine_is_shareable_across_threads() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<OpenBotEngine>();
+    }
+
+    #[test]
+    fn test_custom_policy_rules_applied_without_weakening_baseline() {
+        let (_temp, engine) = setup_mock_engine();
+        engine.set_custom_policy_rules(vec![
+            PolicyRule {
+                pattern: "git push".to_string(),
+                action: crate::policy::PolicyAction::AlwaysDeny,
+                description: "Block git push".to_string(),
+            },
+            PolicyRule {
+                pattern: "apk add".to_string(),
+                action: crate::policy::PolicyAction::AskHuman(crate::policy::RiskLevel::High),
+                description: "Approve package install".to_string(),
+            },
+        ]);
+
+        let denied = engine.request_execute("git push origin main").unwrap();
+        assert!(matches!(denied, ActionOutcome::Denied { .. }));
+
+        let baseline_denied = engine.request_execute("rm -rf /").unwrap();
+        assert!(matches!(baseline_denied, ActionOutcome::Denied { .. }));
+
+        let approval = engine.request_execute("apk add python3").unwrap();
+        assert!(matches!(approval, ActionOutcome::NeedsApproval(_)));
     }
 
     #[test]

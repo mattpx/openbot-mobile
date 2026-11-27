@@ -81,6 +81,31 @@ object OpenBotCore {
         }
     }
 
+    fun setCustomPolicyRules(rules: List<CustomPolicyRule>): Boolean {
+        return when (mode) {
+            CoreMode.NATIVE -> try {
+                val arr = JSONArray()
+                for (rule in rules) {
+                    val obj = JSONObject().apply {
+                        put("pattern", rule.pattern)
+                        put("description", rule.description.ifBlank { "Custom rule: ${rule.pattern}" })
+                        when (rule.action) {
+                            "AlwaysDeny" -> put("action", "AlwaysDeny")
+                            "AlwaysAllow" -> put("action", "AlwaysAllow")
+                            else -> put("action", JSONObject().put("AskHuman", rule.risk))
+                        }
+                    }
+                    arr.put(obj)
+                }
+                nativeSetCustomPolicyRules(arr.toString())
+            } catch (_: Throwable) {
+                false
+            }
+            CoreMode.DEBUG_MOCK -> true
+            CoreMode.UNAVAILABLE -> false
+        }
+    }
+
     fun requestExecute(command: String): ActionOutcomeData {
         return when (mode) {
             CoreMode.NATIVE -> try {
@@ -298,4 +323,5 @@ object OpenBotCore {
     private external fun nativeResolveApproval(approvalId: String, approved: Boolean): String
     private external fun nativeListPendingApprovals(): String
     private external fun nativeSandboxMode(): String
+    private external fun nativeSetCustomPolicyRules(rulesJson: String): Boolean
 }
